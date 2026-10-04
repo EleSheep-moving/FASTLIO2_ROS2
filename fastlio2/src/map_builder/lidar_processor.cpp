@@ -10,7 +10,7 @@ LidarProcessor::LidarProcessor(Config &config, std::shared_ptr<IESKF> kf) : m_co
     m_effect_cloud_lidar.reset(new CloudType(10000, 1));
     m_effect_norm_vec.reset(new CloudType(10000, 1));
     m_nearest_points.resize(10000);
-    m_point_selected_flag.resize(10000, false);
+    m_point_selected_flag.resize(10000, 0);
 
     if (m_config.scan_resolution > 0.0)
     {
@@ -193,21 +193,21 @@ void LidarProcessor::updateLossFunc(State &state, SharedState &share_data)
         auto &points_near = m_nearest_points[i];
         m_ikdtree->Nearest_Search(point_world, m_config.near_search_num, points_near, point_sq_dist);
         if (points_near.size() >= static_cast<size_t>(m_config.near_search_num) && point_sq_dist[m_config.near_search_num - 1] <= 5)
-            m_point_selected_flag[i] = true;
+            m_point_selected_flag[i] = 1;
         else
-            m_point_selected_flag[i] = false;
+            m_point_selected_flag[i] = 0;
         if (!m_point_selected_flag[i])
             continue;
 
         Eigen::Vector4d pabcd;
-        m_point_selected_flag[i] = false;
+        m_point_selected_flag[i] = 0;
         if (esti_plane(points_near, 0.1, pabcd))
         {
             double pd2 = pabcd(0) * point_world_vec(0) + pabcd(1) * point_world_vec(1) + pabcd(2) * point_world_vec(2) + pabcd(3);
             double s = 1 - 0.9 * std::fabs(pd2) / std::sqrt(point_body_vec.norm());
             if (s > 0.9)
             {
-                m_point_selected_flag[i] = true;
+                m_point_selected_flag[i] = 1;
                 m_norm_vec->points[i].x = pabcd(0);
                 m_norm_vec->points[i].y = pabcd(1);
                 m_norm_vec->points[i].z = pabcd(2);

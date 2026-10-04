@@ -3,6 +3,11 @@ lidar_topic: /livox/lidar
 body_frame: body
 world_frame: lidar
 print_time_cost: false
+publish_body_cloud: true  # Only needed with PGO/localizer subscribers.
+publish_world_cloud: false
+publish_path: false
+world_cloud_rate_hz: 5.0
+world_cloud_max_points: 2000
 
 lidar_filter_num: 6
 lidar_min_range: 0.5

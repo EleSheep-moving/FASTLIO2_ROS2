@@ -16,12 +16,16 @@ endif()
 
 add_compile_definitions(SOPHUS_USE_BASIC_LOGGING)
 
-add_definitions(-DMP_EN)
-add_definitions(-DMP_PROC_NUM=2)
+option(MP_EN "Enable OpenMP point matching, including on ARM" ON)
+set(MP_PROC_NUM "2" CACHE STRING "Number of OpenMP point-matching threads")
+if(MP_EN AND NOT MP_PROC_NUM MATCHES "^[1-9][0-9]*$")
+  message(FATAL_ERROR "MP_PROC_NUM must be a positive integer")
+endif()
 
 # find dependencies
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(rcl_interfaces REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
@@ -31,15 +35,14 @@ find_package(livox_ros_driver2 REQUIRED)
 find_package(pcl_conversions REQUIRED)
 find_package(geometry_msgs REQUIRED)
 
-find_package(OpenMP QUIET)
+if(MP_EN)
+  find_package(OpenMP REQUIRED COMPONENTS CXX)
+endif()
 find_package(PCL REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(Sophus REQUIRED)
 find_package(yaml-cpp REQUIRED)
 
-
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenMP_CXX_FLAGS}")
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS}   ${OpenMP_C_FLAGS}")
 
 set(SRC_LIST src/map_builder/commons.cpp
              src/map_builder/ieskf.cpp
@@ -50,11 +53,18 @@ set(SRC_LIST src/map_builder/commons.cpp
              src/utils.cpp)
 
 add_executable(lio_node src/lio_node.cpp ${SRC_LIST})
-ament_target_dependencies(lio_node rclcpp std_msgs tf2 tf2_ros nav_msgs sensor_msgs livox_ros_driver2 pcl_conversions geometry_msgs)
+ament_target_dependencies(lio_node rclcpp rcl_interfaces std_msgs tf2 tf2_ros nav_msgs sensor_msgs livox_ros_driver2 pcl_conversions geometry_msgs)
 target_link_libraries(lio_node
   yaml-cpp
   ${PCL_LIBRARIES}
 )
+if(MP_EN)
+  target_compile_definitions(lio_node PRIVATE MP_EN MP_PROC_NUM=${MP_PROC_NUM})
+  target_link_libraries(lio_node OpenMP::OpenMP_CXX)
+  message(STATUS "FAST-LIO OpenMP: ON (${MP_PROC_NUM} threads)")
+else()
+  message(STATUS "FAST-LIO OpenMP: OFF")
+endif()
 
 
 install(TARGETS lio_node DESTINATION lib/${PROJECT_NAME})

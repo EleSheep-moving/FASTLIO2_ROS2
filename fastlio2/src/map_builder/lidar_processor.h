@@ -1,4 +1,6 @@
 #pragma once
+#include <cstdint>
+#include <vector>
 #include "commons.h"
 #include "ieskf.h"
 #include "ikd_Tree.h"
@@ -15,6 +17,10 @@ struct LocalMap
 class LidarProcessor
 {
 public:
+    // Each parallel iteration owns a byte. vector<bool> packs neighbouring flags
+    // into shared words and its read/modify/write operations can lose updates.
+    using PointSelectionFlags = std::vector<std::uint8_t>;
+
     LidarProcessor(Config &config, std::shared_ptr<IESKF> kf);
 
     void trimCloudMap();
@@ -39,7 +45,7 @@ private:
     CloudType::Ptr m_cloud_lidar;
     CloudType::Ptr m_cloud_down_lidar;
     CloudType::Ptr m_cloud_down_world;
-    std::vector<bool> m_point_selected_flag;
+    PointSelectionFlags m_point_selected_flag;
     CloudType::Ptr m_norm_vec;
     CloudType::Ptr m_effect_cloud_lidar;
     CloudType::Ptr m_effect_norm_vec;

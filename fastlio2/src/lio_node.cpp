@@ -4,6 +4,8 @@
 #include <memory>
 #include <iostream>
 #include <chrono>
+#include <cmath>
+#include <stdexcept>
 // #include <filesystem>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/imu.hpp>
@@ -29,6 +31,13 @@ struct NodeConfig
     std::string body_frame = "body";
     std::string world_frame = "lidar";
     bool print_time_cost = false;
+    bool publish_body_cloud = true;  // Functional input for PGO / ICP localization.
+    bool publish_world_cloud = false;
+    bool publish_path = false;
+    double world_cloud_rate_hz = 5.0;
+    int world_cloud_max_points = 2000;
+    double path_rate_hz = 1.0;
+    int path_max_poses = 1000;
 };
 struct StateData
 {
@@ -53,10 +62,12 @@ public:
         m_imu_sub = this->create_subscription<sensor_msgs::msg::Imu>(m_node_config.imu_topic, 10, std::bind(&LIONode::imuCB, this, std::placeholders::_1));
         m_lidar_sub = this->create_subscription<livox_ros_driver2::msg::CustomMsg>(m_node_config.lidar_topic, 10, std::bind(&LIONode::lidarCB, this, std::placeholders::_1));
 
-        m_body_cloud_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>("body_cloud", 10000);
-        m_world_cloud_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>("world_cloud", 10000);
-        m_path_pub = this->create_publisher<nav_msgs::msg::Path>("lio_path", 10000);
-        m_odom_pub = this->create_publisher<nav_msgs::msg::Odometry>("lio_odom", 10000);
+        // Reliable QoS remains compatible with PGO/localizer message_filters.
+        // Bound optional-output queues so a slow visualizer cannot retain 10000 scans.
+        m_body_cloud_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>("body_cloud", 2);
+        m_world_cloud_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>("world_cloud", 2);
+        m_path_pub = this->create_publisher<nav_msgs::msg::Path>("lio_path", 1);
+        m_odom_pub = this->create_publisher<nav_msgs::msg::Odometry>("lio_odom", 10);
         m_tf_broadcaster = std::make_shared<tf2_ros::TransformBroadcaster>(*this);
 
         m_state_data.path.poses.clear();
@@ -87,6 +98,31 @@ public:
         m_node_config.body_frame = config["body_frame"].as<std::string>();
         m_node_config.world_frame = config["world_frame"].as<std::string>();
         m_node_config.print_time_cost = config["print_time_cost"].as<bool>();
+        rcl_interfaces::msg::ParameterDescriptor output_descriptor;
+        output_descriptor.read_only = true;
+        m_node_config.publish_body_cloud = declare_parameter<bool>(
+            "publish_body_cloud", config["publish_body_cloud"].as<bool>(true), output_descriptor);
+        m_node_config.publish_world_cloud = declare_parameter<bool>(
+            "publish_world_cloud", config["publish_world_cloud"].as<bool>(false), output_descriptor);
+        m_node_config.publish_path = declare_parameter<bool>(
+            "publish_path", config["publish_path"].as<bool>(false), output_descriptor);
+        m_node_config.world_cloud_rate_hz = declare_parameter<double>(
+            "world_cloud_rate_hz", config["world_cloud_rate_hz"].as<double>(5.0), output_descriptor);
+        m_node_config.world_cloud_max_points = declare_parameter<int>(
+            "world_cloud_max_points", config["world_cloud_max_points"].as<int>(2000), output_descriptor);
+        m_node_config.path_rate_hz = declare_parameter<double>(
+            "path_rate_hz", config["path_rate_hz"].as<double>(1.0), output_descriptor);
+        m_node_config.path_max_poses = declare_parameter<int>(
+            "path_max_poses", config["path_max_poses"].as<int>(1000), output_descriptor);
+        if (!std::isfinite(m_node_config.world_cloud_rate_hz) || m_node_config.world_cloud_rate_hz <= 0.0 ||
+            m_node_config.world_cloud_max_points < 100 || !std::isfinite(m_node_config.path_rate_hz) ||
+            m_node_config.path_rate_hz <= 0.0 || m_node_config.path_max_poses < 1)
+            throw std::invalid_argument("Invalid optional-output rate or point/path bound");
+        RCLCPP_INFO(get_logger(), "Optional outputs: body=%s, world=%s (%.1f Hz, at most %d points), path=%s",
+                    m_node_config.publish_body_cloud ? "on" : "off",
+                    m_node_config.publish_world_cloud ? "on" : "off",
+                    m_node_config.world_cloud_rate_hz, m_node_config.world_cloud_max_points,
+                    m_node_config.publish_path ? "on" : "off");
 
         m_builder_config.lidar_filter_num = config["lidar_filter_num"].as<int>();
         m_builder_config.lidar_min_range = config["lidar_min_range"].as<double>();
@@ -218,7 +254,10 @@ public:
         pose.pose.orientation.y = q.y();
         pose.pose.orientation.z = q.z();
         pose.pose.orientation.w = q.w();
+        if (m_state_data.path.poses.size() >= static_cast<size_t>(m_node_config.path_max_poses))
+            m_state_data.path.poses.erase(m_state_data.path.poses.begin());
         m_state_data.path.poses.push_back(pose);
+        m_state_data.path.header.stamp = pose.header.stamp;
         path_pub->publish(m_state_data.path);
     }
 
@@ -257,19 +296,44 @@ public:
         if (m_builder->status() != BuilderStatus::MAPPING)
             return;
 
+        // Deliver the estimator state before any optional point-cloud work.
+        publishOdometry(m_odom_pub, m_node_config.world_frame, m_node_config.body_frame, m_package.cloud_end_time);
         broadCastTF(m_tf_broadcaster, m_node_config.world_frame, m_node_config.body_frame, m_package.cloud_end_time);
 
-        publishOdometry(m_odom_pub, m_node_config.world_frame, m_node_config.body_frame, m_package.cloud_end_time);
-
-        CloudType::Ptr body_cloud = m_builder->lidar_processor()->transformCloud(m_package.cloud, m_kf->x().r_il, m_kf->x().t_il);
-
-        publishCloud(m_body_cloud_pub, body_cloud, m_node_config.body_frame, m_package.cloud_end_time);
-
-        CloudType::Ptr world_cloud = m_builder->lidar_processor()->transformCloud(m_package.cloud, m_builder->lidar_processor()->r_wl(), m_builder->lidar_processor()->t_wl());
-
-        publishCloud(m_world_cloud_pub, world_cloud, m_node_config.world_frame, m_package.cloud_end_time);
-
-        publishPath(m_path_pub, m_node_config.world_frame, m_package.cloud_end_time);
+        // Check both the switch and demand BEFORE allocation / coordinate transformation.
+        if (m_node_config.publish_body_cloud && m_body_cloud_pub->get_subscription_count() > 0)
+        {
+            CloudType::Ptr body_cloud = m_builder->lidar_processor()->transformCloud(
+                m_package.cloud, m_kf->x().r_il, m_kf->x().t_il);
+            publishCloud(m_body_cloud_pub, body_cloud, m_node_config.body_frame, m_package.cloud_end_time);
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (m_node_config.publish_world_cloud && m_world_cloud_pub->get_subscription_count() > 0 &&
+            std::chrono::duration<double>(now - m_last_world_cloud).count() >= 1.0 / m_node_config.world_cloud_rate_hz)
+        {
+            // Uniform selection is the same bounded sampling used by the map-quality gate.
+            // Select before transforming, and never alter the estimator's input/map clouds.
+            CloudType::Ptr selected = m_package.cloud;
+            const size_t maximum = static_cast<size_t>(m_node_config.world_cloud_max_points);
+            if (selected->size() > maximum)
+            {
+                const size_t stride = 1 + (selected->size() - 1) / maximum;
+                selected.reset(new CloudType);
+                selected->reserve(maximum);
+                for (size_t i = 0; i < m_package.cloud->size(); i += stride)
+                    selected->push_back(m_package.cloud->points[i]);
+            }
+            CloudType::Ptr world_cloud = m_builder->lidar_processor()->transformCloud(
+                selected, m_builder->lidar_processor()->r_wl(), m_builder->lidar_processor()->t_wl());
+            publishCloud(m_world_cloud_pub, world_cloud, m_node_config.world_frame, m_package.cloud_end_time);
+            m_last_world_cloud = now;
+        }
+        if (m_node_config.publish_path && m_path_pub->get_subscription_count() > 0 &&
+            std::chrono::duration<double>(now - m_last_path).count() >= 1.0 / m_node_config.path_rate_hz)
+        {
+            publishPath(m_path_pub, m_node_config.world_frame, m_package.cloud_end_time);
+            m_last_path = now;
+        }
     }
 
 private:
@@ -282,6 +346,7 @@ private:
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr m_odom_pub;
 
     rclcpp::TimerBase::SharedPtr m_timer;
+    std::chrono::steady_clock::time_point m_last_world_cloud{}, m_last_path{};
     StateData m_state_data;
     SyncPackage m_package;
     NodeConfig m_node_config;
