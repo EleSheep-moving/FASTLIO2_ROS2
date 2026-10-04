@@ -62,7 +62,11 @@ void IMUProcessor::undistort(SyncPackage &package)
     const double propagate_time_end = package.cloud_end_time;
 
     m_poses_cache.clear();
-    m_poses_cache.emplace_back(0.0, m_last_acc, m_last_gyro, m_kf->x().v, m_kf->x().t_wi, m_kf->x().r_wi);
+    // The state is at the previous scan end, which can precede this scan start
+    // after skipped scans. Keep the pose history on its actual time axis.
+    m_poses_cache.emplace_back(m_last_propagate_end_time - cloud_time_begin,
+                              m_last_acc, m_last_gyro, m_kf->x().v,
+                              m_kf->x().t_wi, m_kf->x().r_wi);
 
     V3D acc_val, gyro_val;
     double dt = 0.0;
@@ -115,7 +119,7 @@ void IMUProcessor::undistort(SyncPackage &package)
         V3D imu_acc = tail->acc;
         V3D imu_gyro = tail->gyro;
 
-        for (; it_pcl->curvature / double(1000) > head->offset; it_pcl--)
+        for (; it_pcl->curvature / double(1000) >= head->offset; it_pcl--)
         {
             dt = it_pcl->curvature / double(1000) - head->offset;
             V3D point(it_pcl->x, it_pcl->y, it_pcl->z);
@@ -126,7 +130,7 @@ void IMUProcessor::undistort(SyncPackage &package)
             it_pcl->y = p_compensate(1);
             it_pcl->z = p_compensate(2);
             if (it_pcl == package.cloud->points.begin())
-                break;
+                return;  // Every point, including the scan-start point, is corrected once.
         }
     }
 }
