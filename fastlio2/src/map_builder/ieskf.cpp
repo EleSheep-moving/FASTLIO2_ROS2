@@ -77,6 +77,7 @@ void IESKF::predict(const Input &inp, double dt, const M12D &Q)
 
 void IESKF::update()
 {
+    m_last_iterations = 0;
     State predict_x = m_x;
     SharedState shared_data;
     shared_data.iter_num = 0;
@@ -88,6 +89,7 @@ void IESKF::update()
     for (size_t i = 0; i < m_max_iter; i++)
     {
         m_loss_func(m_x, shared_data);
+        m_last_iterations = i + 1;
         if (!shared_data.valid)
             break;
         H.setZero();

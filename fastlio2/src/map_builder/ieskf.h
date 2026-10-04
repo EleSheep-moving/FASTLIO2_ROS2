@@ -72,9 +72,11 @@ public:
     State &x() { return m_x; }
 
     M21D &P() { return m_P; }
+    size_t lastIterations() const { return m_last_iterations; }
 
 private:
     size_t m_max_iter = 10;
+    size_t m_last_iterations = 0;
     State m_x;
     M21D m_P;
     loss_func m_loss_func;

@@ -76,6 +76,11 @@ install(DIRECTORY config DESTINATION share/${PROJECT_NAME})
 
 
 if(BUILD_TESTING)
+  find_package(Threads REQUIRED)
+  add_executable(test_timing_trace test/test_timing_trace.cpp)
+  target_include_directories(test_timing_trace PRIVATE src)
+  target_link_libraries(test_timing_trace Threads::Threads)
+  add_test(NAME test_timing_trace COMMAND test_timing_trace)
   find_package(ament_cmake_gtest REQUIRED)
   ament_add_gtest(test_imu_deskew test/test_imu_deskew.cpp
     src/map_builder/imu_processor.cpp src/map_builder/ieskf.cpp)

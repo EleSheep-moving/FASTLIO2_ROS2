@@ -12,6 +12,7 @@
 #include <livox_ros_driver2/msg/custom_msg.hpp>
 
 #include "utils.h"
+#include "timing_trace.h"
 #include "map_builder/commons.h"
 #include "map_builder/map_builder.h"
 
@@ -38,6 +39,7 @@ struct NodeConfig
     int world_cloud_max_points = 2000;
     double path_rate_hz = 1.0;
     int path_max_poses = 1000;
+    std::string timing_trace_path;
 };
 struct StateData
 {
@@ -58,6 +60,7 @@ public:
     {
         RCLCPP_INFO(this->get_logger(), "LIO Node Started");
         loadParameters();
+        m_trace = std::make_unique<TimingTrace>(m_node_config.timing_trace_path);
 
         m_imu_sub = this->create_subscription<sensor_msgs::msg::Imu>(m_node_config.imu_topic, 10, std::bind(&LIONode::imuCB, this, std::placeholders::_1));
         m_lidar_sub = this->create_subscription<livox_ros_driver2::msg::CustomMsg>(m_node_config.lidar_topic, 10, std::bind(&LIONode::lidarCB, this, std::placeholders::_1));
@@ -76,6 +79,27 @@ public:
         m_kf = std::make_shared<IESKF>();
         m_builder = std::make_shared<MapBuilder>(m_builder_config, m_kf);
         m_timer = this->create_wall_timer(20ms, std::bind(&LIONode::timerCB, this));
+    }
+    ~LIONode() override {
+        if (m_trace && !m_trace->flush())
+            RCLCPP_ERROR(get_logger(), "Failed to flush timing trace");
+    }
+
+    void trace(const char *kind, uint64_t id, double stamp, size_t pending = 0,
+               size_t imu_count = 0, double core_ms = 0, double output_ms = 0) {
+        if (!m_trace->enabled()) return;
+        TimingTrace::Event event{kind, id, stamp};
+        event.steady_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        event.ros_ns = now().nanoseconds();
+        event.pending = pending; event.imu_count = imu_count;
+        event.core_ms = core_ms; event.output_ms = output_ms;
+        if (core_ms > 0 && m_builder->status() == BuilderStatus::MAPPING) {
+            event.iterations = m_kf->lastIterations();
+            event.points = m_builder->lidar_processor()->downsampledPoints();
+            event.map_points = m_builder->lidar_processor()->mapPoints();
+        }
+        m_trace->record(event);
     }
 
     void loadParameters()
@@ -100,6 +124,8 @@ public:
         m_node_config.print_time_cost = config["print_time_cost"].as<bool>();
         rcl_interfaces::msg::ParameterDescriptor output_descriptor;
         output_descriptor.read_only = true;
+        m_node_config.timing_trace_path = declare_parameter<std::string>(
+            "timing_trace_path", config["timing_trace_path"].as<std::string>(""), output_descriptor);
         m_node_config.publish_body_cloud = declare_parameter<bool>(
             "publish_body_cloud", config["publish_body_cloud"].as<bool>(true), output_descriptor);
         m_node_config.publish_world_cloud = declare_parameter<bool>(
@@ -151,6 +177,7 @@ public:
 
     void imuCB(const sensor_msgs::msg::Imu::SharedPtr msg)
     {
+        trace("imu_received", 0, Utils::getSec(msg->header));
         std::lock_guard<std::mutex> lock(m_state_data.imu_mutex);
         double timestamp = Utils::getSec(msg->header);
         if (timestamp < m_state_data.last_imu_time)
@@ -165,6 +192,7 @@ public:
     }
     void lidarCB(const livox_ros_driver2::msg::CustomMsg::SharedPtr msg)
     {
+        trace("lidar_received", 0, Utils::getSec(msg->header));
         CloudType::Ptr cloud = Utils::livox2PCL(msg, m_builder_config.lidar_filter_num, m_builder_config.lidar_min_range, m_builder_config.lidar_max_range);
         std::lock_guard<std::mutex> lock(m_state_data.lidar_mutex);
         double timestamp = Utils::getSec(msg->header);
@@ -283,9 +311,13 @@ public:
     {
         if (!syncPackage())
             return;
-        auto t1 = std::chrono::high_resolution_clock::now();
+        const auto scan_id = ++m_scan_id;
+        trace("ready", scan_id, m_package.cloud_end_time, m_state_data.lidar_buffer.size(), m_package.imus.size());
+        auto t1 = std::chrono::steady_clock::now();
         m_builder->process(m_package);
-        auto t2 = std::chrono::high_resolution_clock::now();
+        auto t2 = std::chrono::steady_clock::now();
+        const double core_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
+        trace("core", scan_id, m_package.cloud_end_time, 0, m_package.imus.size(), core_ms);
 
         if (m_node_config.print_time_cost)
         {
@@ -334,6 +366,8 @@ public:
             publishPath(m_path_pub, m_node_config.world_frame, m_package.cloud_end_time);
             m_last_path = now;
         }
+        trace("output", scan_id, m_package.cloud_end_time, 0, m_package.imus.size(), core_ms,
+              std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t2).count());
     }
 
 private:
@@ -346,6 +380,8 @@ private:
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr m_odom_pub;
 
     rclcpp::TimerBase::SharedPtr m_timer;
+    std::unique_ptr<TimingTrace> m_trace;
+    uint64_t m_scan_id = 0;
     std::chrono::steady_clock::time_point m_last_world_cloud{}, m_last_path{};
     StateData m_state_data;
     SyncPackage m_package;
