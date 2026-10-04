@@ -1,4 +1,7 @@
-#include <mutex>
+#include <thread>
+#ifdef __linux__
+#include <pthread.h>
+#endif
 #include <vector>
 #include <queue>
 #include <memory>
@@ -13,6 +16,7 @@
 
 #include "utils.h"
 #include "timing_trace.h"
+#include "input_buffer.h"
 #include "map_builder/commons.h"
 #include "map_builder/map_builder.h"
 
@@ -40,27 +44,26 @@ struct NodeConfig
     double path_rate_hz = 1.0;
     int path_max_poses = 1000;
     std::string timing_trace_path;
+    int lidar_queue_capacity = 2;
+    int imu_queue_capacity = 4096;
+    double imu_max_gap_sec = 0.03;
 };
 struct StateData
 {
-    bool lidar_pushed = false;
-    std::mutex imu_mutex;
-    std::mutex lidar_mutex;
-    double last_lidar_time = -1.0;
-    double last_imu_time = -1.0;
-    std::deque<IMUData> imu_buffer;
-    std::deque<std::pair<double, pcl::PointCloud<pcl::PointXYZINormal>::Ptr>> lidar_buffer;
     nav_msgs::msg::Path path;
 };
 
 class LIONode : public rclcpp::Node
 {
 public:
+    using InputBuffer = LioInputBuffer<livox_ros_driver2::msg::CustomMsg::ConstSharedPtr, IMUData>;
     LIONode() : Node("lio_node")
     {
         RCLCPP_INFO(this->get_logger(), "LIO Node Started");
         loadParameters();
         m_trace = std::make_unique<TimingTrace>(m_node_config.timing_trace_path);
+        m_inputs = std::make_unique<InputBuffer>(m_node_config.lidar_queue_capacity,
+            m_node_config.imu_queue_capacity, m_node_config.imu_max_gap_sec);
 
         m_imu_sub = this->create_subscription<sensor_msgs::msg::Imu>(m_node_config.imu_topic, 10, std::bind(&LIONode::imuCB, this, std::placeholders::_1));
         m_lidar_sub = this->create_subscription<livox_ros_driver2::msg::CustomMsg>(m_node_config.lidar_topic, 10, std::bind(&LIONode::lidarCB, this, std::placeholders::_1));
@@ -78,11 +81,32 @@ public:
 
         m_kf = std::make_shared<IESKF>();
         m_builder = std::make_shared<MapBuilder>(m_builder_config, m_kf);
-        m_timer = this->create_wall_timer(20ms, std::bind(&LIONode::timerCB, this));
+        // Start last: the worker owns all estimator, conversion and output state.
+        m_worker = std::thread(&LIONode::work, this);
     }
-    ~LIONode() override {
-        if (m_trace && !m_trace->flush())
-            RCLCPP_ERROR(get_logger(), "Failed to flush timing trace");
+    ~LIONode() override { finish(); }
+    void requestStop() { m_inputs->stop(); }
+    std::string error() const { return m_inputs->error(); }
+    // Called after spin returns, never from a callback or the worker itself.
+    void finish() {
+        if (m_finished) return;
+        requestStop();
+        if (m_worker.joinable()) m_worker.join();
+        if (!m_trace->flush()) RCLCPP_ERROR(get_logger(), "Failed to flush timing trace");
+        const auto stats = m_inputs->stats();
+        RCLCPP_INFO(get_logger(),
+            "Input summary: scans=%lu imus=%lu claimed=%lu processed=%lu dropped=%lu invalid=%lu "
+            "duplicate_scans=%lu duplicate_imus=%lu consumed_imus=%lu pending=%zu imu_pending=%zu "
+            "max_pending=%zu max_imu_pending=%zu",
+            stats.received_scans, stats.received_imus, stats.claimed_scans, m_processed,
+            stats.dropped_scans, stats.invalid_scans, stats.duplicate_scans, stats.duplicate_imus,
+            stats.consumed_imus, stats.pending, stats.imu_pending, stats.max_pending, stats.max_imu_pending);
+        m_finished = true;
+    }
+    void fail(const std::exception &error) {
+        m_inputs->stop(error.what());
+        RCLCPP_FATAL(get_logger(), "%s", error.what());
+        rclcpp::shutdown(get_node_base_interface()->get_context());
     }
 
     void trace(const char *kind, uint64_t id, double stamp, size_t pending = 0,
@@ -124,6 +148,15 @@ public:
         m_node_config.print_time_cost = config["print_time_cost"].as<bool>();
         rcl_interfaces::msg::ParameterDescriptor output_descriptor;
         output_descriptor.read_only = true;
+        m_node_config.lidar_queue_capacity = declare_parameter<int>(
+            "lidar_queue_capacity", config["lidar_queue_capacity"].as<int>(2), output_descriptor);
+        m_node_config.imu_queue_capacity = declare_parameter<int>(
+            "imu_queue_capacity", config["imu_queue_capacity"].as<int>(4096), output_descriptor);
+        m_node_config.imu_max_gap_sec = declare_parameter<double>(
+            "imu_max_gap_sec", config["imu_max_gap_sec"].as<double>(0.03), output_descriptor);
+        if (m_node_config.lidar_queue_capacity < 1 || m_node_config.imu_queue_capacity < 1 ||
+            !std::isfinite(m_node_config.imu_max_gap_sec) || m_node_config.imu_max_gap_sec <= 0)
+            throw std::invalid_argument("Invalid input queue capacity or IMU gap");
         m_node_config.timing_trace_path = declare_parameter<std::string>(
             "timing_trace_path", config["timing_trace_path"].as<std::string>(""), output_descriptor);
         m_node_config.publish_body_cloud = declare_parameter<bool>(
@@ -151,6 +184,8 @@ public:
                     m_node_config.publish_path ? "on" : "off");
 
         m_builder_config.lidar_filter_num = config["lidar_filter_num"].as<int>();
+        if (m_builder_config.lidar_filter_num < 1)
+            throw std::invalid_argument("lidar_filter_num must be positive");
         m_builder_config.lidar_min_range = config["lidar_min_range"].as<double>();
         m_builder_config.lidar_max_range = config["lidar_max_range"].as<double>();
         m_builder_config.scan_resolution = config["scan_resolution"].as<double>();
@@ -175,61 +210,74 @@ public:
         m_builder_config.lidar_cov_inv = config["lidar_cov_inv"].as<double>();
     }
 
-    void imuCB(const sensor_msgs::msg::Imu::SharedPtr msg)
+    void imuCB(const sensor_msgs::msg::Imu::ConstSharedPtr msg)
     {
-        trace("imu_received", 0, Utils::getSec(msg->header));
-        std::lock_guard<std::mutex> lock(m_state_data.imu_mutex);
-        double timestamp = Utils::getSec(msg->header);
-        if (timestamp < m_state_data.last_imu_time)
-        {
-            RCLCPP_WARN(this->get_logger(), "IMU Message is out of order");
-            std::deque<IMUData>().swap(m_state_data.imu_buffer);
-        }
-        m_state_data.imu_buffer.emplace_back(V3D(msg->linear_acceleration.x, msg->linear_acceleration.y, msg->linear_acceleration.z) * 10.0,
-                                             V3D(msg->angular_velocity.x, msg->angular_velocity.y, msg->angular_velocity.z),
-                                             timestamp);
-        m_state_data.last_imu_time = timestamp;
+        try {
+            double timestamp = Utils::getSec(msg->header);
+            const V3D acceleration = V3D(msg->linear_acceleration.x,
+                msg->linear_acceleration.y, msg->linear_acceleration.z) * 10.0;
+            const V3D angular_velocity(msg->angular_velocity.x,
+                msg->angular_velocity.y, msg->angular_velocity.z);
+            if (!acceleration.allFinite() || !angular_velocity.allFinite())
+                throw std::runtime_error("Non-finite IMU measurement");
+            trace("imu_received", 0, timestamp);
+            m_inputs->pushImu(IMUData(acceleration, angular_velocity, timestamp));
+        } catch (const std::exception &error) { fail(error); }
     }
-    void lidarCB(const livox_ros_driver2::msg::CustomMsg::SharedPtr msg)
+    void lidarCB(const livox_ros_driver2::msg::CustomMsg::ConstSharedPtr msg)
     {
-        trace("lidar_received", 0, Utils::getSec(msg->header));
-        CloudType::Ptr cloud = Utils::livox2PCL(msg, m_builder_config.lidar_filter_num, m_builder_config.lidar_min_range, m_builder_config.lidar_max_range);
-        std::lock_guard<std::mutex> lock(m_state_data.lidar_mutex);
-        double timestamp = Utils::getSec(msg->header);
-        if (timestamp < m_state_data.last_lidar_time)
-        {
-            RCLCPP_WARN(this->get_logger(), "Lidar Message is out of order");
-            std::deque<std::pair<double, pcl::PointCloud<pcl::PointXYZINormal>::Ptr>>().swap(m_state_data.lidar_buffer);
-        }
-        m_state_data.lidar_buffer.emplace_back(timestamp, cloud);
-        m_state_data.last_lidar_time = timestamp;
+        try {
+            const auto received = std::chrono::steady_clock::now();
+            const double timestamp = Utils::getSec(msg->header);
+            trace("lidar_received", 0, timestamp);
+            m_inputs->pushScan(timestamp, msg, received);
+        } catch (const std::exception &error) { fail(error); }
     }
 
-    bool syncPackage()
+    void work()
     {
-        if (m_state_data.imu_buffer.empty() || m_state_data.lidar_buffer.empty())
-            return false;
-        if (!m_state_data.lidar_pushed)
-        {
-            m_package.cloud = m_state_data.lidar_buffer.front().second;
-            std::sort(m_package.cloud->points.begin(), m_package.cloud->points.end(), [](PointType &p1, PointType &p2)
-                      { return p1.curvature < p2.curvature; });
-            m_package.cloud_start_time = m_state_data.lidar_buffer.front().first;
-            m_package.cloud_end_time = m_package.cloud_start_time + m_package.cloud->points.back().curvature / 1000.0;
-            m_state_data.lidar_pushed = true;
-        }
-        if (m_state_data.last_imu_time < m_package.cloud_end_time)
-            return false;
-
-        Vec<IMUData>().swap(m_package.imus);
-        while (!m_state_data.imu_buffer.empty() && m_state_data.imu_buffer.front().time < m_package.cloud_end_time)
-        {
-            m_package.imus.emplace_back(m_state_data.imu_buffer.front());
-            m_state_data.imu_buffer.pop_front();
-        }
-        m_state_data.lidar_buffer.pop_front();
-        m_state_data.lidar_pushed = false;
-        return true;
+#ifdef __linux__
+        pthread_setname_np(pthread_self(), "lio_worker");
+#endif
+        try {
+            while (const auto candidate = m_inputs->waitCandidate()) {
+                const auto &message = candidate->payload;
+                trace("convert", candidate->id, candidate->stamp);
+                if (message->point_num != message->points.size() || message->points.empty()) {
+                    m_inputs->reject(*candidate);
+                    trace("invalid", candidate->id, candidate->stamp);
+                    continue;
+                }
+                auto cloud = Utils::livox2PCL(message, m_builder_config.lidar_filter_num,
+                    m_builder_config.lidar_min_range, m_builder_config.lidar_max_range);
+                const bool valid = !cloud->empty() && std::all_of(cloud->begin(), cloud->end(),
+                    [](const PointType &point) { return std::isfinite(point.x) &&
+                        std::isfinite(point.y) && std::isfinite(point.z) && std::isfinite(point.curvature); });
+                if (!valid) {
+                    m_inputs->reject(*candidate);
+                    trace("invalid", candidate->id, candidate->stamp);
+                    continue;
+                }
+                std::sort(cloud->begin(), cloud->end(), [](const PointType &a, const PointType &b) {
+                    return a.curvature < b.curvature;
+                });
+                const double end = candidate->stamp + cloud->points.back().curvature / 1000.0;
+                trace("wait_imu", candidate->id, end);
+                auto claim = m_inputs->claim(*candidate, end);
+                if (claim.status == InputBuffer::ClaimStatus::Stopped) break;
+                if (claim.status != InputBuffer::ClaimStatus::Taken) {
+                    trace(claim.status == InputBuffer::ClaimStatus::Superseded ? "superseded" : "invalid",
+                          candidate->id, candidate->stamp);
+                    continue;
+                }
+                m_package.cloud = std::move(cloud);
+                m_package.cloud_start_time = candidate->stamp;
+                m_package.cloud_end_time = end;
+                m_package.imus = std::move(claim.imus);
+                if (m_inputs->stopped()) break;
+                processPackage(candidate->id);
+            }
+        } catch (const std::exception &error) { fail(error); }
     }
 
     void publishCloud(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub, CloudType::Ptr cloud, std::string frame_id, const double &time)
@@ -307,14 +355,12 @@ public:
         broad_caster->sendTransform(transformStamped);
     }
 
-    void timerCB()
+    void processPackage(uint64_t scan_id)
     {
-        if (!syncPackage())
-            return;
-        const auto scan_id = ++m_scan_id;
-        trace("ready", scan_id, m_package.cloud_end_time, m_state_data.lidar_buffer.size(), m_package.imus.size());
+        trace("ready", scan_id, m_package.cloud_end_time, m_inputs->stats().pending, m_package.imus.size());
         auto t1 = std::chrono::steady_clock::now();
         m_builder->process(m_package);
+        ++m_processed;
         auto t2 = std::chrono::steady_clock::now();
         const double core_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
         trace("core", scan_id, m_package.cloud_end_time, 0, m_package.imus.size(), core_ms);
@@ -325,7 +371,7 @@ public:
             RCLCPP_WARN(this->get_logger(), "Time cost: %.2f ms", time_used);
         }
 
-        if (m_builder->status() != BuilderStatus::MAPPING)
+        if (m_inputs->stopped() || m_builder->status() != BuilderStatus::MAPPING)
             return;
 
         // Deliver the estimator state before any optional point-cloud work.
@@ -379,9 +425,11 @@ private:
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr m_path_pub;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr m_odom_pub;
 
-    rclcpp::TimerBase::SharedPtr m_timer;
+    std::unique_ptr<InputBuffer> m_inputs;
     std::unique_ptr<TimingTrace> m_trace;
-    uint64_t m_scan_id = 0;
+    std::thread m_worker;
+    uint64_t m_processed = 0;
+    bool m_finished = false;
     std::chrono::steady_clock::time_point m_last_world_cloud{}, m_last_path{};
     StateData m_state_data;
     SyncPackage m_package;
@@ -395,7 +443,20 @@ private:
 int main(int argc, char **argv)
 {
     rclcpp::init(argc, argv);
-    rclcpp::spin(std::make_shared<LIONode>());
-    rclcpp::shutdown();
-    return 0;
+    try {
+        auto node = std::make_shared<LIONode>();
+        const std::weak_ptr<LIONode> weak_node(node);
+        rclcpp::on_shutdown([weak_node] {
+            if (const auto node = weak_node.lock()) node->requestStop();
+        }, node->get_node_base_interface()->get_context());
+        rclcpp::spin(node);
+        node->finish();
+        const bool failed = !node->error().empty();
+        rclcpp::shutdown();
+        return failed ? 1 : 0;
+    } catch (const std::exception &error) {
+        RCLCPP_FATAL(rclcpp::get_logger("lio_node"), "%s", error.what());
+        rclcpp::shutdown();
+        return 1;
+    }
 }
