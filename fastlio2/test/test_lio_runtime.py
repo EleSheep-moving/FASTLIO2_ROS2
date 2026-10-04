@@ -9,6 +9,7 @@ import unittest
 import rclpy
 from sensor_msgs.msg import Imu
 from livox_ros_driver2.msg import CustomMsg, CustomPoint
+from rcl_interfaces.srv import GetParameters
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--binary', required=True)
@@ -49,6 +50,17 @@ class RuntimeTests(unittest.TestCase):
         while publisher.get_subscription_count() < 1 and time.monotonic() < deadline:
             rclpy.spin_once(self.node, timeout_sec=0.02)
         self.assertGreater(publisher.get_subscription_count(), 0)
+        # DDS endpoints appear during construction, before spin starts. A
+        # service reply proves that the executor can drain a shallow reader.
+        client = self.node.create_client(GetParameters, '/runtime_lio/lio_node/get_parameters')
+        self.assertTrue(client.wait_for_service(timeout_sec=2))
+        request = GetParameters.Request()
+        request.names = ['lidar_queue_capacity']
+        future = client.call_async(request)
+        rclpy.spin_until_future_complete(self.node, future, timeout_sec=2)
+        self.assertTrue(future.done(), 'executor did not become ready')
+        self.assertIsNotNone(future.result())
+        self.node.destroy_client(client)
 
     def stop(self):
         self.process.send_signal(signal.SIGINT)
@@ -156,6 +168,31 @@ class RuntimeTests(unittest.TestCase):
             time.sleep(0.03)
         self.assertNotEqual(self.process.wait(timeout=2), 0)
         self.assertIn('backwards', self.process.communicate()[0])
+
+    def test_process_pause_preserves_imu_history(self):
+        # Keep the source history too: this test isolates our receiving depth.
+        publisher = self.node.create_publisher(Imu, '/livox/imu', 4096)
+        self.start()
+        self.discover(publisher)
+        publisher.publish(self.imu(0))
+        time.sleep(0.05)
+        self.process.send_signal(signal.SIGSTOP)
+        try:
+            for number in range(1, 81):
+                publisher.publish(self.imu(number * 5_000_000))
+                time.sleep(0.005)
+        finally:
+            self.process.send_signal(signal.SIGCONT)
+        for number in range(81, 131):
+            publisher.publish(self.imu(number * 5_000_000))
+            time.sleep(0.005)
+        time.sleep(0.1)
+        self.assertIsNone(self.process.poll(), 'continuous source IMU caused a fault after pause')
+        output = self.stop()
+        self.assertIn(' imus=131 ', output)
+        self.assertIn(' duplicate_imus=0 ', output)
+        self.assertIn(' consumed_imus=0 ', output)
+        self.assertIn(' imu_pending=131 ', output)
 
 
 if __name__ == '__main__':

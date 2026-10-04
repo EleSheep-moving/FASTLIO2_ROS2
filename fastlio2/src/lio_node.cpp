@@ -65,7 +65,11 @@ public:
         m_inputs = std::make_unique<InputBuffer>(m_node_config.lidar_queue_capacity,
             m_node_config.imu_queue_capacity, m_node_config.imu_max_gap_sec);
 
-        m_imu_sub = this->create_subscription<sensor_msgs::msg::Imu>(m_node_config.imu_topic, 10, std::bind(&LIONode::imuCB, this, std::placeholders::_1));
+        // Keep DDS history aligned with the propagation buffer. Reliable depth
+        // 10 can stall IMU delivery after a receiving-process pause in Humble.
+        m_imu_sub = this->create_subscription<sensor_msgs::msg::Imu>(
+            m_node_config.imu_topic, rclcpp::QoS(m_node_config.imu_queue_capacity),
+            std::bind(&LIONode::imuCB, this, std::placeholders::_1));
         m_lidar_sub = this->create_subscription<livox_ros_driver2::msg::CustomMsg>(m_node_config.lidar_topic, 10, std::bind(&LIONode::lidarCB, this, std::placeholders::_1));
 
         // Reliable QoS remains compatible with PGO/localizer message_filters.
