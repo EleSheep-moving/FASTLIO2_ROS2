@@ -39,11 +39,10 @@ public:
         std::vector<Imu> imus;
     };
 
-    LioInputBuffer(size_t scan_capacity, size_t imu_capacity, double maximum_imu_gap)
-        : scan_capacity_(scan_capacity), imu_capacity_(imu_capacity),
-          maximum_imu_gap_(maximum_imu_gap) {
-        if (!scan_capacity || !imu_capacity || !std::isfinite(maximum_imu_gap) || maximum_imu_gap <= 0)
-            throw std::invalid_argument("Invalid input queue capacity or IMU gap");
+    LioInputBuffer(size_t scan_capacity, size_t imu_capacity)
+        : scan_capacity_(scan_capacity), imu_capacity_(imu_capacity) {
+        if (!scan_capacity || !imu_capacity)
+            throw std::invalid_argument("Invalid input queue capacity");
     }
 
     bool pushImu(const Imu &imu) {
@@ -56,8 +55,6 @@ public:
                 ++stats_.duplicate_imus;
                 return false;
             }
-            if (last_imu_ && imu.time - *last_imu_ > maximum_imu_gap_ + 1e-9)
-                throw std::runtime_error("IMU source-time gap exceeds imu_max_gap_sec");
             if (imus_.size() >= imu_capacity_)
                 throw std::runtime_error("IMU buffer overflow: refusing to discard propagation history");
             imus_.push_back(imu);
@@ -170,7 +167,6 @@ private:
         return !scans_.empty() && scans_.front().id == candidate.id;
     }
     const size_t scan_capacity_, imu_capacity_;
-    const double maximum_imu_gap_;
     mutable std::mutex mutex_;
     std::condition_variable cv_;
     std::deque<Candidate> scans_;

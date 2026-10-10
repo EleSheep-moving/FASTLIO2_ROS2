@@ -46,7 +46,6 @@ struct NodeConfig
     std::string timing_trace_path;
     int lidar_queue_capacity = 2;
     int imu_queue_capacity = 4096;
-    double imu_max_gap_sec = 0.03;
 };
 struct StateData
 {
@@ -63,7 +62,7 @@ public:
         loadParameters();
         m_trace = std::make_unique<TimingTrace>(m_node_config.timing_trace_path);
         m_inputs = std::make_unique<InputBuffer>(m_node_config.lidar_queue_capacity,
-            m_node_config.imu_queue_capacity, m_node_config.imu_max_gap_sec);
+            m_node_config.imu_queue_capacity);
 
         // Keep DDS history aligned with the propagation buffer. Reliable depth
         // 10 can stall IMU delivery after a receiving-process pause in Humble.
@@ -156,11 +155,8 @@ public:
             "lidar_queue_capacity", config["lidar_queue_capacity"].as<int>(2), output_descriptor);
         m_node_config.imu_queue_capacity = declare_parameter<int>(
             "imu_queue_capacity", config["imu_queue_capacity"].as<int>(4096), output_descriptor);
-        m_node_config.imu_max_gap_sec = declare_parameter<double>(
-            "imu_max_gap_sec", config["imu_max_gap_sec"].as<double>(0.03), output_descriptor);
-        if (m_node_config.lidar_queue_capacity < 1 || m_node_config.imu_queue_capacity < 1 ||
-            !std::isfinite(m_node_config.imu_max_gap_sec) || m_node_config.imu_max_gap_sec <= 0)
-            throw std::invalid_argument("Invalid input queue capacity or IMU gap");
+        if (m_node_config.lidar_queue_capacity < 1 || m_node_config.imu_queue_capacity < 1)
+            throw std::invalid_argument("Invalid input queue capacity");
         m_node_config.timing_trace_path = declare_parameter<std::string>(
             "timing_trace_path", config["timing_trace_path"].as<std::string>(""), output_descriptor);
         m_node_config.publish_body_cloud = declare_parameter<bool>(

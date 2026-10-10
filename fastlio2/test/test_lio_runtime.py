@@ -103,20 +103,25 @@ class RuntimeTests(unittest.TestCase):
         self.process.send_signal(signal.SIGINT)
         self.assertEqual(self.process.wait(timeout=3), 0)
 
-    def test_missing_imu_interval_exits(self):
+    def test_imu_gap_and_burst_process_covered_scan(self):
         publisher = self.node.create_publisher(Imu, '/livox/imu', 10)
+        lidar = self.node.create_publisher(CustomMsg, '/livox/lidar', 10)
         self.start()
         self.discover(publisher)
-        for nanoseconds in (0, 5_000_000, 100_000_000):
+        self.discover(lidar)
+        lidar.publish(self.scan(0))
+        # Reproduce the field gap followed by a burst of narrowly spaced stamps.
+        for nanoseconds in (0, 5_000_000, 38_572_671, 38_626_202, 38_642_233,
+                            38_652_888, 38_663_447, 38_673_879, 100_000_000):
             publisher.publish(self.imu(nanoseconds))
             time.sleep(0.03)
-        try:
-            code = self.process.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            self.fail('IMU propagation gap was silently accepted')
-        self.assertNotEqual(code, 0)
-        output = self.process.communicate()[0]
-        self.assertIn('gap', output)
+        time.sleep(0.15)
+        self.assertIsNone(self.process.poll(), 'IMU interval must not terminate LIO')
+        output = self.stop()
+        self.assertIn(' imus=9 ', output)
+        self.assertIn(' claimed=1 processed=1 ', output)
+        self.assertIn(' consumed_imus=8 ', output)
+        self.assertIn(' imu_pending=1 ', output)
 
     def test_shutdown_joins_while_waiting_for_imu(self):
         publisher = self.node.create_publisher(CustomMsg, '/livox/lidar', 10)

@@ -2,6 +2,7 @@
 #include <atomic>
 #include <future>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <stdexcept>
@@ -18,7 +19,7 @@ template <typename F> void throws(F &&action) {
     require(caught, "expected runtime error");
 }
 void overflow_preserves_imu() {
-    Buffer buffer(2, 4096, 0.03);
+    Buffer buffer(2, 4096);
     for (int i = 0; i <= 60; ++i) buffer.pushImu({i * 0.005});
     buffer.pushScan(0.0, 1);
     auto old = buffer.waitCandidate();
@@ -36,7 +37,7 @@ void overflow_preserves_imu() {
     require(buffer.stats().imu_pending == 1, "scan-end IMU belongs to next package");
 }
 void wait_releases_lock_and_stop_wakes() {
-    Buffer buffer(2, 4096, 0.03);
+    Buffer buffer(2, 4096);
     buffer.pushScan(0.0, 1);
     auto candidate = buffer.waitCandidate();
     auto future = std::async(std::launch::async, [&] {return buffer.claim(*candidate, 0.1);});
@@ -55,7 +56,7 @@ void wait_releases_lock_and_stop_wakes() {
     require(!waiting.get(), "stop must not return task");
 }
 void stale_candidate_wakes_without_consuming() {
-    Buffer buffer(2, 4096, 0.03);
+    Buffer buffer(2, 4096);
     buffer.pushImu({0.0}); buffer.pushScan(0.0, 1);
     auto candidate = buffer.waitCandidate();
     auto future = std::async(std::launch::async, [&] {return buffer.claim(*candidate, 0.1);});
@@ -69,8 +70,8 @@ void stale_candidate_wakes_without_consuming() {
     require(future.get().status == Buffer::ClaimStatus::Superseded, "stale claim result");
     require(buffer.stats().imu_pending == 1, "stale candidate cannot consume IMU");
 }
-void duplicates_gaps_and_faults() {
-    Buffer buffer(2, 2, 0.03);
+void duplicates_and_faults() {
+    Buffer buffer(2, 2);
     require(buffer.pushImu({0.0}), "first IMU");
     require(!buffer.pushImu({0.0}), "duplicate IMU rejected");
     require(buffer.pushScan(0.0, 1), "first scan");
@@ -79,18 +80,39 @@ void duplicates_gaps_and_faults() {
             "duplicate counters must distinguish sources");
     throws([&] {buffer.pushScan(-0.1, 3);});
     throws([&] {buffer.pushScan(std::numeric_limits<double>::quiet_NaN(), 3);});
-    throws([&] {buffer.pushImu({0.04});});
-    Buffer backwards(2, 2, 0.03);
+    throws([&] {buffer.pushImu({std::numeric_limits<double>::quiet_NaN()});});
+    Buffer backwards(2, 2);
     backwards.pushImu({0.1}); throws([&] {backwards.pushImu({0.09});});
-    Buffer overflow(2, 2, 0.03);
+    Buffer overflow(2, 2);
     overflow.pushImu({0.0}); overflow.pushImu({0.005});
     throws([&] {overflow.pushImu({0.01});});
     require(overflow.stats().imu_pending == 2, "overflow must never discard IMU");
     buffer.stop("explicit failure");
     require(buffer.error() == "explicit failure", "fault identity retained");
 }
+void gap_and_burst_preserve_history_and_wait_for_coverage() {
+    Buffer buffer(2, 4096);
+    const double stamps[] = {0.0, 0.005, 0.038572671, 0.038626202,
+                             0.038642233, 0.038652888, 0.038663447, 0.038673879};
+    for (double stamp : stamps) require(buffer.pushImu({stamp}), "gap/burst IMU accepted");
+    buffer.pushScan(0.0, 1);
+    auto candidate = buffer.waitCandidate();
+    auto waiting = std::async(std::launch::async, [&] {return buffer.claim(*candidate, 0.1);});
+    require(waiting.wait_for(std::chrono::milliseconds(20)) == std::future_status::timeout,
+            "gap/burst must not bypass scan-end coverage");
+    buffer.pushImu({0.1});
+    bool ready = waiting.wait_for(std::chrono::seconds(1)) == std::future_status::ready;
+    if (!ready) buffer.stop();
+    require(ready, "scan-end coverage must wake claim after gap/burst");
+    auto claim = waiting.get();
+    require(claim.status == Buffer::ClaimStatus::Taken, "covered scan taken after gap/burst");
+    require(claim.imus.size() == std::size(stamps), "gap/burst must retain every IMU");
+    for (size_t i = 0; i < claim.imus.size(); ++i)
+        require(claim.imus[i].time == stamps[i], "IMU order and timestamps preserved");
+    require(buffer.stats().imu_pending == 1, "scan-end IMU remains for next package");
+}
 void stop_wakes_coverage_wait() {
-    Buffer buffer(2, 4096, 0.03);
+    Buffer buffer(2, 4096);
     buffer.pushScan(1.0, 1);
     auto candidate = buffer.waitCandidate();
     auto waiting = std::async(std::launch::async, [&] {return buffer.claim(*candidate, 1.1);});
@@ -102,7 +124,7 @@ void stop_wakes_coverage_wait() {
     require(waiting.get().status == Buffer::ClaimStatus::Stopped, "stopped claim status");
 }
 void retired_payload_destructs_outside_lock() {
-    LioInputBuffer<std::shared_ptr<int>, Imu> buffer(1, 4096, 0.03);
+    LioInputBuffer<std::shared_ptr<int>, Imu> buffer(1, 4096);
     int retired = 0;
     auto payload = std::shared_ptr<int>(new int(1), [&](int *value) {
         (void)buffer.stats();  // Would deadlock if the queue destroyed it under its lock.
@@ -114,7 +136,7 @@ void retired_payload_destructs_outside_lock() {
     require(retired == 1, "retired payload destructor completed outside buffer mutex");
 }
 void invalid_scan_retains_imu() {
-    Buffer buffer(2, 4096, 0.03);
+    Buffer buffer(2, 4096);
     buffer.pushImu({0.0}); buffer.pushScan(0.0, 1);
     auto candidate = buffer.waitCandidate();
     buffer.reject(*candidate);
@@ -122,7 +144,7 @@ void invalid_scan_retains_imu() {
     require(buffer.stats().imu_pending == 1, "invalid scan retains IMU");
 }
 void invalid_scan_end_never_waits() {
-    Buffer buffer(2, 4096, 0.03);
+    Buffer buffer(2, 4096);
     buffer.pushScan(1.0, 1);
     auto candidate = buffer.waitCandidate();
     auto waiting = std::async(std::launch::async, [&] {
@@ -136,7 +158,7 @@ void invalid_scan_end_never_waits() {
     throws([&] {buffer.claim(*candidate, 0.5);});
 }
 void concurrent_receive_and_claim() {
-    Buffer buffer(1000, 4096, 0.03);
+    Buffer buffer(1000, 4096);
     std::atomic<int> claimed{0};
     std::thread worker([&] {
         while (auto candidate = buffer.waitCandidate()) {
@@ -159,7 +181,8 @@ int main() {
         {"overflow_preserves_imu", overflow_preserves_imu},
         {"wait_releases_lock_and_stop_wakes", wait_releases_lock_and_stop_wakes},
         {"stale_candidate_wakes_without_consuming", stale_candidate_wakes_without_consuming},
-        {"duplicates_gaps_and_faults", duplicates_gaps_and_faults},
+        {"duplicates_and_faults", duplicates_and_faults},
+        {"gap_and_burst_preserve_history_and_wait_for_coverage", gap_and_burst_preserve_history_and_wait_for_coverage},
         {"invalid_scan_retains_imu", invalid_scan_retains_imu},
         {"invalid_scan_end_never_waits", invalid_scan_end_never_waits},
         {"stop_wakes_coverage_wait", stop_wakes_coverage_wait},
